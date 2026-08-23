@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace hftu {
 
@@ -8,31 +9,50 @@ class OrderBook {
 public:
     static constexpr int SIDE_BID = 0;
     static constexpr int SIDE_ASK = 1;
-    static constexpr int32_t MAX_TICKS = 10'000'000;
+    
+    static constexpr uint32_t TICK_SHIFT = 20; 
+    static constexpr int32_t MAX_TICKS = 1 << TICK_SHIFT; 
+    static constexpr uint32_t PRICE_MASK = MAX_TICKS - 1;
+    
+    // Sentinel for uninitialized or already-cancelled orders
+    static constexpr uint32_t INVALID_IDX = 0xFFFFFFFF;
 
-    // Default sized massively to 30 Million to guarantee we never 
-    // need bounds-checking in the hot path.
-    OrderBook(size_t max_orders = 30'000'000);
+    OrderBook(size_t initial_orders = 1'000'000);
     ~OrderBook();
 
     void add_order(uint64_t id, int side, int64_t price, int64_t quantity);
     void cancel_order(uint64_t id);
 
-    inline int64_t best_bid() const { return best_prices_[0] > 0 ? best_prices_[0] : 0; }
-    inline int64_t best_ask() const { return best_prices_[1] < MAX_TICKS - 1 ? best_prices_[1] : 0; }
+    // LAZY EVALUATION FAST PATH
+    inline int64_t best_bid() const {
+        int32_t p = best_prices_[0];
+        if (counts_[p] > 0) [[likely]] return p;
+        return scan_best_bid(p); 
+    }
+
+    inline int64_t best_ask() const {
+        int32_t p = best_prices_[1];
+        if (counts_[(1 << TICK_SHIFT) | p] > 0) [[likely]] {
+            return p == MAX_TICKS - 1 ? 0 : p;
+        }
+        return scan_best_ask(p);
+    }
 
 private:
-    // __restrict__ tells the compiler these pointers never overlap in memory,
-    // allowing it to reorder assembly instructions for maximum IPC (Instructions Per Cycle).
+    // Safely manages memory boundaries for unpredictable benchmark IDs
+    std::vector<uint32_t> order_info_vec_;
+    
+    // Raw C-pointers extracted from the vector for zero-overhead access
     uint32_t* __restrict__ order_info_;
-    
-    // 2D Arrays: Index 0 is Bids, Index 1 is Asks.
-    int32_t* __restrict__ counts_[2];
-    uint64_t* __restrict__ bitmasks_[2];
-    
-    int32_t best_prices_[2];
+    size_t max_id_;
 
-    void update_best(uint32_t side, int32_t current_price);
+    uint16_t* __restrict__ counts_; 
+    uint64_t* __restrict__ bitmasks_;
+    
+    mutable int32_t best_prices_[2];
+
+    int64_t scan_best_bid(int32_t p) const;
+    int64_t scan_best_ask(int32_t p) const;
 };
 
 } // namespace hftu
