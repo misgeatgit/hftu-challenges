@@ -6,6 +6,10 @@
 #include <iostream>
 #include <vector>
 #include <cstdint>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdexcept>
+#include <cstring>
 
 namespace hftu {
 	// 1. The Intrusive Order Node
@@ -33,7 +37,8 @@ namespace hftu {
 			static constexpr int SIDE_ASK = 1;
 			static constexpr int64_t MAX_TICKS = 10'000'000; // e.g., prices from $0.00 to $1000.00 in pennies
 
-			OrderBook(size_t max_orders = 1'0000'000); 
+			OrderBook(size_t max_orders = 10'0000'000); 
+			~OrderBook();
 
 			void add_order(uint64_t id, int side, int64_t price, int64_t quantity);
 
@@ -44,20 +49,26 @@ namespace hftu {
 			int64_t best_ask() const { return best_ask_price < MAX_TICKS - 1 ? best_ask_price : 0; }
 
 		private:
-			std::vector<Order> arena;
-			std::vector<uint32_t> order_lookup;
+			Order* arena;
+			uint32_t* order_lookup;
 			uint32_t free_head;
+			size_t max_orders_;
 
-			std::vector<PriceLevel> bids;
-			std::vector<PriceLevel> asks;
+			PriceLevel* bids;
+			PriceLevel* asks;
 
-			std::vector<uint64_t> bid_bitmask;
-			std::vector<uint64_t> ask_bitmask;
+			uint64_t* bid_bitmask;
+			uint64_t* ask_bitmask;
 
 			int32_t best_bid_price = 0;
 			int32_t best_ask_price = MAX_TICKS - 1;
 
-			// --- Intrusive List Helpers (Indices instead of pointers) ---
+			// Rounds up to nearest 2MB boundary
+			size_t align_to_huge_page(size_t size) {
+				constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+				return (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+			}
+
 			void insert_into_level(PriceLevel& level, uint32_t idx) {
 				Order& o = arena[idx];
 				o.prev = level.tail;
@@ -75,14 +86,12 @@ namespace hftu {
 				else level.tail = o.prev;
 			}
 
-			// --- Hardware Bitmask Scanning ---
+			// Hardware Bitmask Scanning (Remains the same, highly optimized)
 			void update_best_bid(int32_t current_price) {
 				int32_t word_idx = current_price >> 6;
 				while (word_idx >= 0) {
 					uint64_t w = bid_bitmask[word_idx];
 					if (w) {
-						// __builtin_clzll = Count Leading Zeros.
-						// 63 - clzll finds the highest set bit in 1 CPU cycle.
 						best_bid_price = (word_idx << 6) + (63 - __builtin_clzll(w));
 						return;
 					}
@@ -93,12 +102,10 @@ namespace hftu {
 
 			void update_best_ask(int32_t current_price) {
 				int32_t word_idx = current_price >> 6;
-				int32_t max_word = ask_bitmask.size();
+				int32_t max_word = (MAX_TICKS + 63) / 64;
 				while (word_idx < max_word) {
 					uint64_t w = ask_bitmask[word_idx];
 					if (w) {
-						// __builtin_ctzll = Count Trailing Zeros.
-						// Finds the lowest set bit in 1 CPU cycle.
 						best_ask_price = (word_idx << 6) + __builtin_ctzll(w);
 						return;
 					}
