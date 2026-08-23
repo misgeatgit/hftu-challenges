@@ -71,8 +71,8 @@ namespace hftu {
 	// 4. The Optimized Order Book
 	class OrderBook {
 		public:
-			static constexpr int SIDE_BID = 1;
-			static constexpr int SIDE_ASK = 2;
+			static constexpr int SIDE_BID = 0;
+			static constexpr int SIDE_ASK = 1;
 			static constexpr int64_t MAX_TICKS = 10'000'000; // e.g., prices from $0.00 to $1000.00 in pennies
 
 			OrderBook(size_t max_orders = 1'0000'000); 
