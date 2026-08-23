@@ -1,121 +1,101 @@
+
+// Challenge 01: Order Book — Skeleton Implementation
+// This is a naive reference. You can do much better!
+#pragma once
+
 #include <iostream>
-#include <list>
-#include <unordered_map>
-#include <map>
 #include <vector>
 #include <cstdint>
 
-// ---------------------------------------------------------
-// 1. The Slab Allocator (from previous step)
-// ---------------------------------------------------------
-template <typename T>
-class SlabAllocator {
-public:
-    using value_type = T;
-
-    SlabAllocator() = default;
-
-    template <class U>
-    constexpr SlabAllocator(const SlabAllocator<U>&) noexcept {}
-
-    T* allocate(std::size_t n) {
-        if (n == 1) return static_cast<T*>(get_pool().allocate());
-        return static_cast<T*>(::operator new(n * sizeof(T)));
-    }
-
-    void deallocate(T* p, std::size_t n) noexcept {
-        if (n == 1) get_pool().deallocate(p);
-        else ::operator delete(p);
-    }
-
-    template <class U> bool operator==(const SlabAllocator<U>&) const noexcept { return true; }
-    template <class U> bool operator!=(const SlabAllocator<U>&) const noexcept { return false; }
-
-private:
-    struct Pool {
-        static constexpr std::size_t chunk_size = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
-        static constexpr std::size_t blocks_per_slab = 1024;
-        
-        struct FreeNode { FreeNode* next; };
-        FreeNode* free_list = nullptr;
-        std::vector<void*> slabs;
-
-        ~Pool() {
-            for (void* slab : slabs) ::operator delete(slab);
-        }
-
-        void* allocate() {
-            if (!free_list) {
-                void* new_slab = ::operator new(chunk_size * blocks_per_slab);
-                slabs.push_back(new_slab);
-                char* memory = static_cast<char*>(new_slab);
-                for (std::size_t i = 0; i < blocks_per_slab - 1; ++i) {
-                    reinterpret_cast<FreeNode*>(memory + i * chunk_size)->next = 
-                        reinterpret_cast<FreeNode*>(memory + (i + 1) * chunk_size);
-                }
-                reinterpret_cast<FreeNode*>(memory + (blocks_per_slab - 1) * chunk_size)->next = nullptr;
-                free_list = reinterpret_cast<FreeNode*>(memory);
-            }
-            void* result = free_list;
-            free_list = free_list->next;
-            return result;
-        }
-
-        void deallocate(void* p) {
-            FreeNode* node = static_cast<FreeNode*>(p);
-            node->next = free_list;
-            free_list = node;
-        }
-    };
-
-    static Pool& get_pool() {
-        thread_local Pool pool;
-        return pool;
-    }
-};
-
-// ---------------------------------------------------------
-// 2. The Order Book Implementation
-// ---------------------------------------------------------
 namespace hftu {
+	// 1. The Intrusive Order Node
+	struct Order {
+		uint64_t id;
+		int side;
+		int64_t price;
+		int64_t quantity;
+		Order* prev = nullptr;
+		Order* next = nullptr;
+	};
 
-struct Order {
-    uint64_t id;
-    int side;
-    int64_t price;
-    int64_t quantity;
-};
+	// 2. The Price Level Queue (O(1) insertion and deletion)
+	struct PriceLevelQueue {
+		Order* head = nullptr;
+		Order* tail = nullptr;
 
-// Define the custom list type
-using OrderList = std::list<Order, SlabAllocator<Order>>;
+		bool is_empty() const { return head == nullptr; }
 
-class OrderBook {
-public:
-    static constexpr int SIDE_BID = 1; // Buy
-    static constexpr int SIDE_ASK = 2; // Sell
+		void push_back(Order* order) {
+			order->next = nullptr;
+			order->prev = tail;
+			if (tail) tail->next = order;
+			else head = order;
+			tail = order;
+		}
 
-    void add_order(uint64_t id, int side, int64_t price, int64_t quantity);
+		void erase(Order* order) {
+			if (order->prev) order->prev->next = order->next;
+			else head = order->next;
 
-    void cancel_order(uint64_t id);
+			if (order->next) order->next->prev = order->prev;
+			else tail = order->prev;
+		}
+	};
 
-    // std::greater ensures bids are sorted highest-to-lowest
-    int64_t best_bid() const;
+	// 3. The Pre-allocated Memory Arena
+	class OrderArena {
+		std::vector<Order> memory_block;
+		Order* free_list_head = nullptr;
+		public:
+		explicit OrderArena(size_t capacity) {
+			memory_block.resize(capacity);
+			for (size_t i = 0; i < capacity - 1; ++i) {
+				memory_block[i].next = &memory_block[i + 1];
+			}
+			memory_block.back().next = nullptr;
+			free_list_head = &memory_block[0];
+		}
 
-    // std::less ensures asks are sorted lowest-to-highest
-    int64_t best_ask() const;
+		Order* allocate() {
+			Order* order = free_list_head;
+			free_list_head = free_list_head->next;
+			return order;
+		}
 
-private:
-    // Tracks order locations for O(1) lookup and cancellation
-    struct OrderTracker {
-        OrderList::iterator it;
-        int64_t price;
-        int side;
-    };
+		void deallocate(Order* order) {
+			order->next = free_list_head;
+			free_list_head = order;
+		}
+	};
 
-    std::map<int64_t, OrderList, std::greater<int64_t>> bids;
-    std::map<int64_t, OrderList, std::less<int64_t>> asks;
-    std::unordered_map<uint64_t, OrderTracker> orders;
-};
+	// 4. The Optimized Order Book
+	class OrderBook {
+		public:
+			static constexpr int SIDE_BID = 1;
+			static constexpr int SIDE_ASK = 2;
+			static constexpr int64_t MAX_TICKS = 10000000; // e.g., prices from $0.00 to $1000.00 in pennies
+
+			OrderBook(size_t max_orders = 10'0000'000); 
+
+			void add_order(uint64_t id, int side, int64_t price, int64_t quantity);
+
+			void cancel_order(uint64_t id);
+
+			// Pure O(1) lookups
+			int64_t best_bid() const { return best_bid_price > 0 ? best_bid_price : 0; }
+			int64_t best_ask() const { return best_ask_price < MAX_TICKS - 1 ? best_ask_price : 0; }
+
+		private:
+			OrderArena arena;
+			std::vector<Order*> order_lookup;
+
+			// Flat arrays for price levels
+			std::vector<PriceLevelQueue> bids;
+			std::vector<PriceLevelQueue> asks;
+
+			// Trackers for O(1) querying
+			int64_t best_bid_price = 0;
+			int64_t best_ask_price = MAX_TICKS - 1;
+	};
 
 } // namespace hftu
-
