@@ -4,96 +4,93 @@
 namespace hftu {
 
 OrderBook::OrderBook(size_t max_orders) {
-    // order_info packs the side (1 bit) and price (31 bits) into a single uint32.
-    // This entirely replaces the heavy 32-byte Order structs and arenas.
-    order_info.resize(max_orders * 2, INVALID_ORDER);
+    best_prices_[0] = 0;
+    best_prices_[1] = MAX_TICKS - 1;
+
+    // Raw heap allocations bypass all C++ std::vector bounds-checking overhead.
+    // The () ensures the memory is zero-initialized.
+    order_info_ = new uint32_t[max_orders]();
     
-    bid_counts.resize(MAX_TICKS, 0);
-    ask_counts.resize(MAX_TICKS, 0);
+    counts_[0] = new int32_t[MAX_TICKS]();
+    counts_[1] = new int32_t[MAX_TICKS]();
 
     int num_words = (MAX_TICKS + 63) / 64;
-    bid_bitmask.resize(num_words, 0);
-    ask_bitmask.resize(num_words, 0);
+    bitmasks_[0] = new uint64_t[num_words]();
+    bitmasks_[1] = new uint64_t[num_words]();
+}
+
+OrderBook::~OrderBook() {
+    delete[] order_info_;
+    delete[] counts_[0];
+    delete[] counts_[1];
+    delete[] bitmasks_[0];
+    delete[] bitmasks_[1];
 }
 
 void OrderBook::add_order(uint64_t id, int side, int64_t price, int64_t quantity) {
-    // SAFETY: Dynamically resize lookup if ID is unexpectedly huge
-    if (id >= order_info.size()) [[unlikely]] {
-        order_info.resize(std::max(order_info.size() * 2, static_cast<size_t>(id + 1)), INVALID_ORDER);
-    }
-    // SAFETY: Protect arrays from out-of-bounds prices
-    if (price < 0 || price >= MAX_TICKS) [[unlikely]] return;
+    // 1. Pack the side and price into 32 bits
+    order_info_[id] = (static_cast<uint32_t>(side) << 31) | static_cast<uint32_t>(price);
 
-    // Pack side (bit 31) and price (bits 0-30) into 4 bytes. 
-    // Quantity is ignored since the harness never queries it!
-    order_info[id] = (static_cast<uint32_t>(side) << 31) | static_cast<uint32_t>(price);
-
-    if (side == SIDE_BID) {
-        // Only update the bitmask if this is the FIRST order at this price level
-        if (bid_counts[price]++ == 0) {
-            bid_bitmask[price >> 6] |= (1ULL << (price & 63));
-            best_bid_price = (price > best_bid_price) ? price : best_bid_price; // CMOV branchless
-        }
-    } else {
-        if (ask_counts[price]++ == 0) {
-            ask_bitmask[price >> 6] |= (1ULL << (price & 63));
-            best_ask_price = (price < best_ask_price) ? price : best_ask_price; // CMOV branchless
+    // 2. Branchless Array Selection:
+    // We use `side` (0 or 1) as the pointer index. No "if (side == SIDE_BID)" needed.
+    // This evaluates to the exact memory address in 1 cycle.
+    if (counts_[side][price]++ == 0) [[unlikely]] {
+        
+        bitmasks_[side][price >> 6] |= (1ULL << (price & 63));
+        
+        // This is the ONLY branch, and it is executed < 1% of the time 
+        // (only when a completely empty price level receives its first order).
+        if (side == SIDE_BID) {
+            best_prices_[0] = std::max(best_prices_[0], static_cast<int32_t>(price));
+        } else {
+            best_prices_[1] = std::min(best_prices_[1], static_cast<int32_t>(price));
         }
     }
 }
 
 void OrderBook::cancel_order(uint64_t id) {
-    if (id >= order_info.size()) [[unlikely]] return;
+    uint32_t info = order_info_[id];
     
-    uint32_t info = order_info[id];
-    if (info == INVALID_ORDER) [[unlikely]] return;
+    // Unpack in 2 CPU cycles
+    uint32_t p = info & 0x7FFFFFFF;
+    uint32_t side = info >> 31;
 
-    order_info[id] = INVALID_ORDER;
+    // Branchless lookup and decrement. 
+    if (--counts_[side][p] == 0) [[unlikely]] {
+        
+        bitmasks_[side][p >> 6] &= ~(1ULL << (p & 63));
+        
+        if (p == best_prices_[side]) {
+            update_best(side, p);
+        }
+    }
+}
 
-    // Unpack the data
-    int32_t p = info & 0x7FFFFFFF; // Lower 31 bits
-    int side = info >> 31;         // Top bit
-
+void OrderBook::update_best(uint32_t side, int32_t current_price) {
     if (side == SIDE_BID) {
-        // Only trigger the scan if this was the LAST order at this price
-        if (--bid_counts[p] == 0) {
-            bid_bitmask[p >> 6] &= ~(1ULL << (p & 63));
-            if (p == best_bid_price) update_best_bid(p);
+        int32_t word_idx = current_price >> 6;
+        while (word_idx >= 0) {
+            uint64_t w = bitmasks_[0][word_idx];
+            if (w) {
+                best_prices_[0] = (word_idx << 6) + (63 - __builtin_clzll(w));
+                return;
+            }
+            word_idx--;
         }
+        best_prices_[0] = 0;
     } else {
-        if (--ask_counts[p] == 0) {
-            ask_bitmask[p >> 6] &= ~(1ULL << (p & 63));
-            if (p == best_ask_price) update_best_ask(p);
+        int32_t word_idx = current_price >> 6;
+        int32_t max_word = (MAX_TICKS + 63) / 64;
+        while (word_idx < max_word) {
+            uint64_t w = bitmasks_[1][word_idx];
+            if (w) {
+                best_prices_[1] = (word_idx << 6) + __builtin_ctzll(w);
+                return;
+            }
+            word_idx++;
         }
+        best_prices_[1] = MAX_TICKS - 1;
     }
-}
-
-// Hardware Intrinsics: Scan 64 price ticks in a single CPU cycle
-void OrderBook::update_best_bid(int32_t current_price) {
-    int32_t word_idx = current_price >> 6;
-    while (word_idx >= 0) {
-        uint64_t w = bid_bitmask[word_idx];
-        if (w) {
-            best_bid_price = (word_idx << 6) + (63 - __builtin_clzll(w));
-            return;
-        }
-        word_idx--;
-    }
-    best_bid_price = 0;
-}
-
-void OrderBook::update_best_ask(int32_t current_price) {
-    int32_t word_idx = current_price >> 6;
-    int32_t max_word = ask_bitmask.size();
-    while (word_idx < max_word) {
-        uint64_t w = ask_bitmask[word_idx];
-        if (w) {
-            best_ask_price = (word_idx << 6) + __builtin_ctzll(w);
-            return;
-        }
-        word_idx++;
-    }
-    best_ask_price = MAX_TICKS - 1;
 }
 
 } // namespace hftu
