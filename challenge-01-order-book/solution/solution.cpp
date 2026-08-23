@@ -5,42 +5,56 @@
 
 namespace hftu {
 
-void OrderBook::add_order(uint64_t id, int side, int64_t price, int64_t quantity) {
-    orders_[id] = {side, price, quantity};
-    if (side == 0) {
-        bids_[price] += quantity;
-    } else {
-        asks_[price] += quantity;
-    }
-}
+	void OrderBook::add_order(uint64_t id, int side, int64_t price, int64_t quantity) {
+		Order order{id, side, price, quantity};
 
-void OrderBook::cancel_order(uint64_t id) {
-    auto it = orders_.find(id);
-    if (it == orders_.end()) return;
+		if (side == SIDE_BID) {
+			auto& list = bids[price];
+			list.push_back(order);
+			// Store iterator for O(1) cancellation
+			orders[id] = {std::prev(list.end()), price, side};
+		} else {
+			auto& list = asks[price];
+			list.push_back(order);
+			orders[id] = {std::prev(list.end()), price, side};
+		}
+	}
 
-    auto& order = it->second;
-    if (order.side == 0) {
-        auto bit = bids_.find(order.price);
-        if (bit != bids_.end()) {
-            bit->second -= order.quantity;
-            if (bit->second <= 0) bids_.erase(bit);
-        }
-    } else {
-        auto ait = asks_.find(order.price);
-        if (ait != asks_.end()) {
-            ait->second -= order.quantity;
-            if (ait->second <= 0) asks_.erase(ait);
-        }
-    }
-    orders_.erase(it);
-}
+	void OrderBook::cancel_order(uint64_t id) {
+		auto it = orders.find(id);
+		if (it == orders.end()) return; // Order not found
 
-int64_t OrderBook::best_bid() const {
-    return bids_.empty() ? 0 : bids_.begin()->first;
-}
+		auto& tracker = it->second;
 
-int64_t OrderBook::best_ask() const {
-    return asks_.empty() ? 0 : asks_.begin()->first;
-}
+		if (tracker.side == SIDE_BID) {
+			auto& list = bids[tracker.price];
+			list.erase(tracker.it); // O(1) removal using allocator!
+
+			// Clean up the price level if it's empty to keep best_bid() O(1)
+			if (list.empty()) {
+				bids.erase(tracker.price);
+			}
+		} else {
+			auto& list = asks[tracker.price];
+			list.erase(tracker.it);
+
+			if (list.empty()) {
+				asks.erase(tracker.price);
+			}
+		}
+
+		orders.erase(it);
+	}
+
+
+
+	int64_t OrderBook::best_bid() const {
+		return bids.empty() ? 0 : bids.begin()->first;
+	}
+
+	// std::less ensures asks are sorted lowest-to-highest
+	int64_t OrderBook::best_ask() const {
+		return asks.empty() ? 0 : asks.begin()->first;
+	}
 
 } // namespace hftu
