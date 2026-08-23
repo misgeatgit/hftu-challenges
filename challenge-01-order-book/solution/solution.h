@@ -9,63 +9,21 @@
 
 namespace hftu {
 	// 1. The Intrusive Order Node
-	struct Order {
+	struct alignas(32) Order {
 		uint64_t id;
-		int side;
-		int64_t price;
-		int64_t quantity;
-		Order* prev = nullptr;
-		Order* next = nullptr;
+		int32_t price;
+		int32_t quantity;
+		int32_t side;
+		uint32_t prev;
+		uint32_t next;
+		uint32_t padding; // Forces exactly 32 bytes
 	};
 
-	// 2. The Price Level Queue (O(1) insertion and deletion)
-	struct PriceLevelQueue {
-		Order* head = nullptr;
-		Order* tail = nullptr;
+	static constexpr uint32_t NULL_IDX = 0xFFFFFFFF;
 
-		bool is_empty() const { return head == nullptr; }
-
-		void push_back(Order* order) {
-			order->next = nullptr;
-			order->prev = tail;
-			if (tail) tail->next = order;
-			else head = order;
-			tail = order;
-		}
-
-		void erase(Order* order) {
-			if (order->prev) order->prev->next = order->next;
-			else head = order->next;
-
-			if (order->next) order->next->prev = order->prev;
-			else tail = order->prev;
-		}
-	};
-
-	// 3. The Pre-allocated Memory Arena
-	class OrderArena {
-		std::vector<Order> memory_block;
-		Order* free_list_head = nullptr;
-		public:
-		explicit OrderArena(size_t capacity) {
-			memory_block.resize(capacity);
-			for (size_t i = 0; i < capacity - 1; ++i) {
-				memory_block[i].next = &memory_block[i + 1];
-			}
-			memory_block.back().next = nullptr;
-			free_list_head = &memory_block[0];
-		}
-
-		Order* allocate() {
-			Order* order = free_list_head;
-			free_list_head = free_list_head->next;
-			return order;
-		}
-
-		void deallocate(Order* order) {
-			order->next = free_list_head;
-			free_list_head = order;
-		}
+	struct PriceLevel {
+		uint32_t head = NULL_IDX;
+		uint32_t tail = NULL_IDX;
 	};
 
 	// 4. The Optimized Order Book
@@ -86,16 +44,68 @@ namespace hftu {
 			int64_t best_ask() const { return best_ask_price < MAX_TICKS - 1 ? best_ask_price : 0; }
 
 		private:
-			OrderArena arena;
-			std::vector<Order*> order_lookup;
+			std::vector<Order> arena;
+			std::vector<uint32_t> order_lookup;
+			uint32_t free_head;
 
-			// Flat arrays for price levels
-			std::vector<PriceLevelQueue> bids;
-			std::vector<PriceLevelQueue> asks;
+			std::vector<PriceLevel> bids;
+			std::vector<PriceLevel> asks;
 
-			// Trackers for O(1) querying
-			int64_t best_bid_price = 0;
-			int64_t best_ask_price = MAX_TICKS - 1;
+			std::vector<uint64_t> bid_bitmask;
+			std::vector<uint64_t> ask_bitmask;
+
+			int32_t best_bid_price = 0;
+			int32_t best_ask_price = MAX_TICKS - 1;
+
+			// --- Intrusive List Helpers (Indices instead of pointers) ---
+			void insert_into_level(PriceLevel& level, uint32_t idx) {
+				Order& o = arena[idx];
+				o.prev = level.tail;
+				if (level.tail != NULL_IDX) arena[level.tail].next = idx;
+				else level.head = idx;
+				level.tail = idx;
+			}
+
+			void remove_from_level(PriceLevel& level, uint32_t idx) {
+				Order& o = arena[idx];
+				if (o.prev != NULL_IDX) arena[o.prev].next = o.next;
+				else level.head = o.next;
+
+				if (o.next != NULL_IDX) arena[o.next].prev = o.prev;
+				else level.tail = o.prev;
+			}
+
+			// --- Hardware Bitmask Scanning ---
+			void update_best_bid(int32_t current_price) {
+				int32_t word_idx = current_price >> 6;
+				while (word_idx >= 0) {
+					uint64_t w = bid_bitmask[word_idx];
+					if (w) {
+						// __builtin_clzll = Count Leading Zeros.
+						// 63 - clzll finds the highest set bit in 1 CPU cycle.
+						best_bid_price = (word_idx << 6) + (63 - __builtin_clzll(w));
+						return;
+					}
+					word_idx--;
+				}
+				best_bid_price = 0;
+			}
+
+			void update_best_ask(int32_t current_price) {
+				int32_t word_idx = current_price >> 6;
+				int32_t max_word = ask_bitmask.size();
+				while (word_idx < max_word) {
+					uint64_t w = ask_bitmask[word_idx];
+					if (w) {
+						// __builtin_ctzll = Count Trailing Zeros.
+						// Finds the lowest set bit in 1 CPU cycle.
+						best_ask_price = (word_idx << 6) + __builtin_ctzll(w);
+						return;
+					}
+					word_idx++;
+				}
+				best_ask_price = MAX_TICKS - 1;
+			}
 	};
 
 } // namespace hftu
