@@ -73,9 +73,9 @@ namespace hftu {
 		public:
 			static constexpr int SIDE_BID = 1;
 			static constexpr int SIDE_ASK = 2;
-			static constexpr int64_t MAX_TICKS = 10000000; // e.g., prices from $0.00 to $1000.00 in pennies
+			static constexpr int64_t MAX_TICKS = 10'000'000; // e.g., prices from $0.00 to $1000.00 in pennies
 
-			OrderBook(size_t max_orders = 10'0000'000); 
+			OrderBook(size_t max_orders = 1'0000'000); 
 
 			void add_order(uint64_t id, int side, int64_t price, int64_t quantity);
 
