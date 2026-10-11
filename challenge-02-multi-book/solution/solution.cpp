@@ -5,12 +5,10 @@
 namespace hftu {
 
 MultiOrderBook::MultiOrderBook(Venue& venue) : venue_(venue) {
-    // Pre-allocate hash tables with zero allocations during timed phase
     order_hash_ = new HashEntry[HASH_CAPACITY]();
     our_hash_ = new OurHashEntry[OUR_HASH_CAPACITY]();
 
-    // Pre-allocate order pool (e.g. 1.5 million max orders)
-    order_pool_.resize(1'500'000);
+    order_pool_.resize(2'000'000);
     free_order_head_ = 0;
     for (size_t i = 0; i < order_pool_.size(); ++i) {
         order_pool_[i].next_idx = static_cast<uint32_t>(i + 1);
@@ -19,8 +17,8 @@ MultiOrderBook::MultiOrderBook(Venue& venue) : venue_(venue) {
     order_pool_.back().next_idx = 0xFFFFFFFF;
 
     for (int i = 0; i < NUM_SYMBOLS; ++i) {
-        books_[i].bids.reserve(256);
-        books_[i].asks.reserve(256);
+        books_[i].bids.reserve(128);
+        books_[i].asks.reserve(128);
     }
 }
 
@@ -43,51 +41,45 @@ void MultiOrderBook::free_order(uint32_t idx) {
     free_order_head_ = idx;
 }
 
-// Open-addressing hash table lookup for exchange_id
 uint32_t MultiOrderBook::find_order(uint64_t exchange_id) const {
     size_t idx = exchange_id & (HASH_CAPACITY - 1);
-    size_t start_idx = idx;
+    size_t start = idx;
     while (order_hash_[idx].occupied) {
-        if (order_hash_[idx].key == exchange_id) {
-            return order_hash_[idx].value;
-        }
+        if (order_hash_[idx].key == exchange_id) return order_hash_[idx].value;
         idx = (idx + 1) & (HASH_CAPACITY - 1);
-        if (idx == start_idx) break;
+        if (idx == start) break;
     }
     return 0xFFFFFFFF;
 }
 
-void MultiOrderBook::insert_order_hash(uint64_t exchange_id, uint32_t order_idx) {
-    size_t idx = exchange_id & (HASH_CAPACITY - 1);
-    while (order_hash_[idx].occupied) {
-        idx = (idx + 1) & (HASH_CAPACITY - 1);
+void MultiOrderBook::insert_order_hash(uint64_t exchange_id, uint32_t idx) {
+    size_t hash_idx = exchange_id & (HASH_CAPACITY - 1);
+    while (order_hash_[hash_idx].occupied) {
+        hash_idx = (hash_idx + 1) & (HASH_CAPACITY - 1);
     }
-    order_hash_[idx] = {exchange_id, order_idx, true};
+    order_hash_[hash_idx] = {exchange_id, idx, true};
 }
 
 void MultiOrderBook::remove_order_hash(uint64_t exchange_id) {
-    size_t idx = exchange_id & (HASH_CAPACITY - 1);
-    size_t start_idx = idx;
-    while (order_hash_[idx].occupied) {
-        if (order_hash_[idx].key == exchange_id) {
-            order_hash_[idx].occupied = false;
+    size_t hash_idx = exchange_id & (HASH_CAPACITY - 1);
+    size_t start = hash_idx;
+    while (order_hash_[hash_idx].occupied) {
+        if (order_hash_[hash_idx].key == exchange_id) {
+            order_hash_[hash_idx].occupied = false;
             return;
         }
-        idx = (idx + 1) & (HASH_CAPACITY - 1);
-        if (idx == start_idx) break;
+        hash_idx = (hash_idx + 1) & (HASH_CAPACITY - 1);
+        if (hash_idx == start) break;
     }
 }
 
-// Our ID mapping hash table
 uint64_t MultiOrderBook::find_our_exchange_id(uint64_t our_id) const {
     size_t idx = our_id & (OUR_HASH_CAPACITY - 1);
-    size_t start_idx = idx;
+    size_t start = idx;
     while (our_hash_[idx].occupied) {
-        if (our_hash_[idx].our_id == our_id) {
-            return our_hash_[idx].exchange_id;
-        }
+        if (our_hash_[idx].our_id == our_id) return our_hash_[idx].exchange_id;
         idx = (idx + 1) & (OUR_HASH_CAPACITY - 1);
-        if (idx == start_idx) break;
+        if (idx == start) break;
     }
     return 0;
 }
@@ -102,18 +94,17 @@ void MultiOrderBook::insert_our_mapping(uint64_t our_id, uint64_t exchange_id) {
 
 void MultiOrderBook::remove_our_mapping(uint64_t our_id) {
     size_t idx = our_id & (OUR_HASH_CAPACITY - 1);
-    size_t start_idx = idx;
+    size_t start = idx;
     while (our_hash_[idx].occupied) {
         if (our_hash_[idx].our_id == our_id) {
             our_hash_[idx].occupied = false;
             return;
         }
         idx = (idx + 1) & (OUR_HASH_CAPACITY - 1);
-        if (idx == start_idx) break;
+        if (idx == start) break;
     }
 }
 
-// Price level management
 PriceLevel* MultiOrderBook::find_level(uint16_t symbol, int side, int64_t price) {
     auto& levels = (side == 0) ? books_[symbol].bids : books_[symbol].asks;
     auto it = std::lower_bound(levels.begin(), levels.end(), price, 
@@ -152,8 +143,7 @@ void MultiOrderBook::remove_level_if_empty(uint16_t symbol, int side, int64_t pr
 }
 
 // === Order Management ===
-void MultiOrderBook::send_order(uint64_t our_id, uint16_t symbol, int side,
-                                int64_t price, int64_t qty) {
+void MultiOrderBook::send_order(uint64_t our_id, uint16_t symbol, int side, int64_t price, int64_t qty) {
     uint64_t exchange_id = venue_.send_order(our_id, symbol, side, price, qty);
     insert_our_mapping(our_id, exchange_id);
 }
@@ -177,14 +167,12 @@ void MultiOrderBook::cancel_our_order(uint64_t our_id) {
 }
 
 // === Exchange Feed ===
-void MultiOrderBook::add_order(uint64_t exchange_id, uint16_t symbol, int side,
-                               int64_t price, int64_t qty) {
+void MultiOrderBook::add_order(uint64_t exchange_id, uint16_t symbol, int side, int64_t price, int64_t qty) {
     uint32_t order_idx = allocate_order();
     if (order_idx == 0xFFFFFFFF) return;
 
     OrderNode& node = order_pool_[order_idx];
     node.exchange_id = exchange_id;
-    node.our_id = 0; // Linked when matched if ours
     node.symbol = symbol;
     node.side = static_cast<int8_t>(side);
     node.price = price;
